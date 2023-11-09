@@ -1,0 +1,289 @@
+package chaincode
+
+import (
+	"encoding/json"
+	"fmt"
+	"log"
+	"time"
+
+	"github.com/hyperledger/fabric-contract-api-go/contractapi"
+)
+
+/*
+1.1版本 Asset的增删改查，范围查询，历史溯源
+1.2版本 增加Asset的索引结构，索引查询
+*/
+
+const colorOwnerIndex string = "color~owner"
+const assetGlobalName string = "assetGlobal"
+
+type SmartContract struct {
+	contractapi.Contract
+}
+
+type Asset struct {
+	DocType        string `json:"docType"` //docType is used to distinguish the various types of objects in state database
+	ID             string `json:"ID"`      //the field tags are needed to keep case from bouncing around
+	Color          string `json:"color"`
+	Size           int    `json:"size"`
+	Owner          string `json:"owner"`
+	AppraisedValue int    `json:"appraisedValue"`
+}
+
+type AssetGlobal struct {
+	IdNum int `json:"idNum"`
+}
+
+type HistoryQueryResult struct {
+	Record    *Asset    `json:"record"`
+	TxId      string    `json:"txId"`
+	Timestamp time.Time `json:"timestamp"`
+	IsDelete  bool      `json:"isDelete"`
+}
+
+func (s *SmartContract) InitLedger(ctx contractapi.TransactionContextInterface) error {
+	key := "assetGlobal"
+	exist, err := ctx.GetStub().GetState(key)
+	if err != nil {
+		return fmt.Errorf("can not find assetGlobal record, error :%v", err)
+	}
+	if exist != nil {
+		return fmt.Errorf("assetGlobal exist, can not initLedger again.")
+	}
+
+	assetGlobalInstance := &AssetGlobal{
+		IdNum: 0,
+	}
+	assetGlobalInstanceBytes, err := json.Marshal(assetGlobalInstance)
+	if err != nil {
+		return fmt.Errorf("json assetGlobalInstance error :%v", err)
+	}
+
+	err = ctx.GetStub().PutState(assetGlobalName, assetGlobalInstanceBytes)
+	if err != nil {
+		return fmt.Errorf("PutState assetGlobalInstance error:  %v", err)
+	}
+	return nil
+}
+
+func (s *SmartContract) ReadAssetGlobal(ctx contractapi.TransactionContextInterface) (*AssetGlobal, error) {
+	assetGlobalBytes, err := ctx.GetStub().GetState(assetGlobalName)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get asset %s: %v", assetGlobalName, err)
+	}
+	if assetGlobalBytes == nil {
+		return nil, fmt.Errorf("asset %s does not exist", assetGlobalName)
+	}
+
+	var assetGlobalInstance AssetGlobal
+	err = json.Unmarshal(assetGlobalBytes, &assetGlobalInstance)
+	if err != nil {
+		return nil, err
+	}
+
+	return &assetGlobalInstance, nil
+}
+
+func (s *SmartContract) ReadAsset(ctx contractapi.TransactionContextInterface, assetID int) (*Asset, error) {
+	assetBytes, err := ctx.GetStub().GetState(transIDToStr(assetID))
+	if err != nil {
+		return nil, fmt.Errorf("failed to get asset %d: %v", assetID, err)
+	}
+	if assetBytes == nil {
+		return nil, fmt.Errorf("asset %d does not exist", assetID)
+	}
+
+	var asset Asset
+	err = json.Unmarshal(assetBytes, &asset)
+	if err != nil {
+		return nil, err
+	}
+
+	return &asset, nil
+}
+
+func (s *SmartContract) AssetExists(ctx contractapi.TransactionContextInterface, assetID string) (bool, error) {
+	assetBytes, err := ctx.GetStub().GetState(assetID)
+	if err != nil {
+		return false, fmt.Errorf("failed to read asset %s from world state. %v", assetID, err)
+	}
+
+	return assetBytes != nil, nil
+}
+
+func (s *SmartContract) CreateAsset(ctx contractapi.TransactionContextInterface, color string, size int, owner string, appraisedValue int) error {
+	assetGlobalInstance, err := s.ReadAssetGlobal(ctx)
+	if err != nil {
+		return fmt.Errorf("get assetGlobalInstance error: %s", err)
+	}
+
+	var nextAssetID = assetGlobalInstance.IdNum + 1
+
+	assetGlobalNewInstance := &AssetGlobal{
+		IdNum: nextAssetID,
+	}
+	// id补零
+	nextAssetIDStr := transIDToStr(nextAssetID)
+
+	exists, err := s.AssetExists(ctx, nextAssetIDStr)
+	if err != nil {
+		return fmt.Errorf("failed to get asset: %v", err)
+	}
+	if exists {
+		return fmt.Errorf("asset already exists: %s", nextAssetIDStr)
+	}
+
+	asset := &Asset{
+		DocType:        "asset",
+		ID:             nextAssetIDStr,
+		Color:          color,
+		Size:           size,
+		Owner:          owner,
+		AppraisedValue: appraisedValue,
+	}
+
+	assetBytes, err := json.Marshal(asset)
+	if err != nil {
+		return err
+	}
+
+	err = ctx.GetStub().PutState(nextAssetIDStr, assetBytes)
+	if err != nil {
+		return err
+	}
+
+	assetGlobalNewInstanceByte, err := json.Marshal(assetGlobalNewInstance)
+
+	if err != nil {
+		return fmt.Errorf("assetGlobalNewInstance json marshal error:%s", err)
+	}
+
+	err = ctx.GetStub().PutState(assetGlobalName, assetGlobalNewInstanceByte)
+
+	if err != nil {
+		return fmt.Errorf("put assetGlobalName error:%s", err)
+	}
+
+	return nil
+}
+
+func (s *SmartContract) UpdateAsset(ctx contractapi.TransactionContextInterface, assetID int, color string, size int, owner string, appraisedValue int) error {
+	exists, err := s.AssetExists(ctx, transIDToStr(assetID))
+	if err != nil {
+		return fmt.Errorf("failed to get asset: %v", err)
+	}
+	if !exists {
+		return fmt.Errorf("asset not exists: %d", assetID)
+	}
+	asset, err := s.ReadAsset(ctx, assetID)
+	if err != nil {
+		return err
+	}
+
+	asset.Color = color
+	asset.Size = size
+	asset.Owner = owner
+	asset.AppraisedValue = appraisedValue
+
+	assetJSON, err := json.Marshal(asset)
+	if err != nil {
+		return fmt.Errorf("asset json marshal error:%s", err)
+	}
+
+	return ctx.GetStub().PutState(transIDToStr(assetID), assetJSON)
+}
+
+func (s *SmartContract) DeleteAsset(ctx contractapi.TransactionContextInterface, assetID int) error {
+	exists, err := s.AssetExists(ctx, transIDToStr(assetID))
+	if err != nil {
+		return fmt.Errorf("failed to get asset: %v", err)
+	}
+	if !exists {
+		return fmt.Errorf("asset not exists: %d", assetID)
+	}
+
+	err = ctx.GetStub().DelState(transIDToStr(assetID))
+	if err != nil {
+		return fmt.Errorf("failed to delete asset %d: %v", assetID, err)
+	}
+
+	return ctx.GetStub().DelState(transIDToStr(assetID))
+}
+
+func (s *SmartContract) GetAssetsByRangeLatest(ctx contractapi.TransactionContextInterface, pageSize, pageIndex int) ([]*Asset, error) {
+	assetGlobalInstance, err := s.ReadAssetGlobal(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("get assetGlobalInstance error: %s", err)
+	}
+	latestKey := assetGlobalInstance.IdNum
+	var endKey int = latestKey - (pageIndex-1)*pageSize + 1
+	var startKey int = endKey - pageSize
+	startKeyStr := transIDToStr(startKey)
+	endKeyStr := transIDToStr(endKey)
+	resultsIterator, _, err := ctx.GetStub().GetStateByRangeWithPagination(startKeyStr, endKeyStr, int32(pageSize), "")
+	if err != nil {
+		return nil, err
+	}
+	defer resultsIterator.Close()
+
+	return constructQueryResponseFromIterator(resultsIterator)
+}
+
+func (s *SmartContract) GetAssetHistory(ctx contractapi.TransactionContextInterface, assetID, pageSize, pageIndex int) ([]HistoryQueryResult, error) {
+	log.Printf("GetAssetHistory: ID %v", assetID)
+
+	resultsIterator, err := ctx.GetStub().GetHistoryForKey(transIDToStr(assetID))
+	if err != nil {
+		return nil, err
+	}
+	defer resultsIterator.Close()
+
+	var records []HistoryQueryResult
+	var index int = 0
+	var startIndex int = (pageIndex - 1) * pageSize
+	var endIndex int = startIndex + pageIndex
+
+	for resultsIterator.HasNext() {
+		if index < startIndex {
+			_, err := resultsIterator.Next()
+			if err != nil {
+				return nil, err
+			}
+			index++
+			continue
+		}
+		if index >= endIndex {
+			break
+		}
+		response, err := resultsIterator.Next()
+		if err != nil {
+			return nil, err
+		}
+		var asset Asset
+		if len(response.Value) > 0 {
+			err = json.Unmarshal(response.Value, &asset)
+			if err != nil {
+				return nil, err
+			}
+		} else {
+			asset = Asset{
+				ID: transIDToStr(assetID),
+			}
+		}
+		timestamp := response.Timestamp.AsTime()
+		if err != nil {
+			return nil, err
+		}
+		record := HistoryQueryResult{
+			TxId:      response.TxId,
+			Timestamp: timestamp,
+			Record:    &asset,
+			IsDelete:  response.IsDelete,
+		}
+		records = append(records, record)
+		index++
+	}
+	return records, nil
+}
+
+func (s *SmartContract) QueryAssetsByOwner(ctx contractapi.TransactionContextInterface)
