@@ -5,6 +5,7 @@ import (
 	"strconv"
 
 	"github.com/hyperledger/fabric-chaincode-go/shim"
+	"github.com/hyperledger/fabric-contract-api-go/contractapi"
 )
 
 const idStringLong int = 16
@@ -35,4 +36,48 @@ func constructQueryResponseFromIterator(resultIterator shim.StateQueryIteratorIn
 		assets = append(assets, &asset)
 	}
 	return assets, nil
+}
+
+func getQueryResultForQueryString(ctx contractapi.TransactionContextInterface, queryString string) ([]*Asset, error) {
+	resultsIterator, err := ctx.GetStub().GetQueryResult(queryString)
+	if err != nil {
+		return nil, err
+	}
+	defer resultsIterator.Close()
+
+	return constructQueryResponseFromIterator(resultsIterator)
+}
+
+// 索引工具类
+
+// 旧索引的Key，及构造新索引的参数
+func updateIndex(ctx contractapi.TransactionContextInterface, indexName string, indexOldKeyValue, indexNewKeyValue []string) error {
+	indexOldKey, err := ctx.GetStub().CreateCompositeKey(indexName, indexOldKeyValue)
+	if err != nil {
+		return err
+	}
+	indexNewKey, err := ctx.GetStub().CreateCompositeKey(indexName, indexNewKeyValue)
+	if err != nil {
+		return err
+	}
+	value := []byte{0x00}
+	//写入新index
+	err = ctx.GetStub().PutState(indexNewKey, value)
+	if err != nil {
+		return err
+	}
+	//删除旧index
+	err = ctx.GetStub().DelState(indexOldKey)
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+func delIndex(ctx contractapi.TransactionContextInterface, indexName string, indexKeyValue []string) error {
+	indexKey, err := ctx.GetStub().CreateCompositeKey(indexName, indexKeyValue)
+	if err != nil {
+		return err
+	}
+	return ctx.GetStub().DelState(indexKey)
 }

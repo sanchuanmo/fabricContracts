@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"strconv"
 	"time"
 
 	"github.com/hyperledger/fabric-contract-api-go/contractapi"
@@ -14,7 +15,7 @@ import (
 1.2版本 增加Asset的索引结构，索引查询
 */
 
-const colorOwnerIndex string = "color~owner"
+const colorIdIndex string = "color~ID"
 const assetGlobalName string = "assetGlobal"
 
 type SmartContract struct {
@@ -152,6 +153,19 @@ func (s *SmartContract) CreateAsset(ctx contractapi.TransactionContextInterface,
 		return err
 	}
 
+	// 创建索引，基于Color进行范围查询，比如，范围所有颜色为blue 的资产Asset。
+	// 该索引是个复合key，首先要列出对其进行范围查询的key。
+	// 在本案例中，复合key是基于color~ID来构造的
+	colorIdIndexKey, err := ctx.GetStub().CreateCompositeKey(colorIdIndex, []string{asset.Color, asset.ID})
+	if err != nil {
+		return err
+	}
+	value := []byte{0x00}
+	err = ctx.GetStub().PutState(colorIdIndexKey, value)
+	if err != nil {
+		return fmt.Errorf("colorIdIndexKey put state error: %s", err)
+	}
+
 	assetGlobalNewInstanceByte, err := json.Marshal(assetGlobalNewInstance)
 
 	if err != nil {
@@ -167,6 +181,7 @@ func (s *SmartContract) CreateAsset(ctx contractapi.TransactionContextInterface,
 	return nil
 }
 
+// 更新索引后，在updateAsset时也会更新对应索引字段
 func (s *SmartContract) UpdateAsset(ctx contractapi.TransactionContextInterface, assetID int, color string, size int, owner string, appraisedValue int) error {
 	exists, err := s.AssetExists(ctx, transIDToStr(assetID))
 	if err != nil {
@@ -178,6 +193,10 @@ func (s *SmartContract) UpdateAsset(ctx contractapi.TransactionContextInterface,
 	asset, err := s.ReadAsset(ctx, assetID)
 	if err != nil {
 		return err
+	}
+	err = updateIndex(ctx, colorIdIndex, []string{asset.Color, asset.ID}, []string{color, asset.ID})
+	if err != nil {
+		return fmt.Errorf("update asset index error:%s", err)
 	}
 
 	asset.Color = color
@@ -194,11 +213,11 @@ func (s *SmartContract) UpdateAsset(ctx contractapi.TransactionContextInterface,
 }
 
 func (s *SmartContract) DeleteAsset(ctx contractapi.TransactionContextInterface, assetID int) error {
-	exists, err := s.AssetExists(ctx, transIDToStr(assetID))
+	asset, err := s.ReadAsset(ctx, assetID)
 	if err != nil {
 		return fmt.Errorf("failed to get asset: %v", err)
 	}
-	if !exists {
+	if asset != nil {
 		return fmt.Errorf("asset not exists: %d", assetID)
 	}
 
@@ -206,8 +225,8 @@ func (s *SmartContract) DeleteAsset(ctx contractapi.TransactionContextInterface,
 	if err != nil {
 		return fmt.Errorf("failed to delete asset %d: %v", assetID, err)
 	}
-
-	return ctx.GetStub().DelState(transIDToStr(assetID))
+	//删除记录的对应索引
+	return delIndex(ctx, colorIdIndex, []string{asset.Color, asset.ID})
 }
 
 func (s *SmartContract) GetAssetsByRangeLatest(ctx contractapi.TransactionContextInterface, pageSize, pageIndex int) ([]*Asset, error) {
@@ -286,4 +305,120 @@ func (s *SmartContract) GetAssetHistory(ctx contractapi.TransactionContextInterf
 	return records, nil
 }
 
-func (s *SmartContract) QueryAssetsByOwner(ctx contractapi.TransactionContextInterface)
+// 富查询无需使用索引，但使用索引的查询会更有效率
+
+// 常规使用索引富查询案例
+func (s *SmartContract) QueryAssetsByColorIndex(ctx contractapi.TransactionContextInterface, color string) ([]*Asset, error) {
+	coloredAssetResultsIterator, err := ctx.GetStub().GetStateByPartialCompositeKey(colorIdIndex, []string{color})
+	if err != nil {
+		return nil, err
+	}
+	defer coloredAssetResultsIterator.Close()
+
+	var assets []*Asset
+	for coloredAssetResultsIterator.HasNext() {
+		responseRange, err := coloredAssetResultsIterator.Next()
+		if err != nil {
+			return nil, err
+		}
+		_, compositKeyParts, err := ctx.GetStub().SplitCompositeKey(responseRange.Key)
+		if err != nil {
+			return nil, err
+		}
+		if len(compositKeyParts) > 1 {
+			returnedAssetID := compositKeyParts[1]
+			returnedAssetIDInteger, err := strconv.Atoi(returnedAssetID)
+			if err != nil {
+				return nil, err
+			}
+			asset, err := s.ReadAsset(ctx, returnedAssetIDInteger)
+			if err != nil {
+				return nil, err
+			}
+			assets = append(assets, asset)
+		}
+	}
+	return assets, nil
+}
+
+// 常规无索引富查询Color
+func (s *SmartContract) QueryAssetsByColor(ctx contractapi.TransactionContextInterface, color string) ([]*Asset, error) {
+	queryString := fmt.Sprintf(`{"selector":{"docType":"asset","color":"%s"}}`, color)
+	return getQueryResultForQueryString(ctx, queryString)
+}
+
+// 常规无索引富查询案例
+func (s *SmartContract) QueryAssets(ctx contractapi.TransactionContextInterface, queryString string) ([]*Asset, error) {
+	return getQueryResultForQueryString(ctx, queryString)
+}
+
+type PaginatedQueryResult struct {
+	Records             []*Asset `json:"records"`
+	FetchedRecordsCount int32    `json:"fetchedRecordsCount"`
+	Bookmark            string   `json:"bookmark"`
+}
+
+// 常规无索引富查询分页案例
+func (s *SmartContract) QueryAssetsWithPagination(ctx contractapi.TransactionContextInterface, queryString string, pageSize int32, bookmark string) (*PaginatedQueryResult, error) {
+	resultsIterator, responseMetadata, err := ctx.GetStub().GetQueryResultWithPagination(queryString, pageSize, bookmark)
+	if err != nil {
+		return nil, err
+	}
+	defer resultsIterator.Close()
+
+	assets, err := constructQueryResponseFromIterator(resultsIterator)
+	if err != nil {
+		return nil, err
+	}
+
+	return &PaginatedQueryResult{
+		Records:             assets,
+		FetchedRecordsCount: responseMetadata.FetchedRecordsCount,
+		Bookmark:            responseMetadata.Bookmark,
+	}, nil
+}
+
+// 交易
+func (s *SmartContract) TransferAssetByColor(ctx contractapi.TransactionContextInterface, color, newOwner string) error {
+	coloredAssetResultsIterator, err := ctx.GetStub().GetStateByPartialCompositeKey(colorIdIndex, []string{color})
+	if err != nil {
+		return err
+	}
+	defer coloredAssetResultsIterator.Close()
+
+	for coloredAssetResultsIterator.HasNext() {
+		responseRange, err := coloredAssetResultsIterator.Next()
+		if err != nil {
+			return err
+		}
+
+		_, compositeKeyParts, err := ctx.GetStub().SplitCompositeKey(responseRange.Key)
+		if err != nil {
+			return err
+		}
+
+		if len(compositeKeyParts) > 1 {
+			returnedAssetID := compositeKeyParts[1]
+			returnedAssetIDInteger, err := strconv.Atoi(returnedAssetID)
+			if err != nil {
+				return err
+			}
+			asset, err := s.ReadAsset(ctx, returnedAssetIDInteger)
+			if err != nil {
+				return err
+			}
+			asset.Owner = newOwner
+			assetBytes, err := json.Marshal(asset)
+			if err != nil {
+				return err
+			}
+			err = ctx.GetStub().PutState(returnedAssetID, assetBytes)
+			if err != nil {
+				return fmt.Errorf("transfer failed for asset %s: %v", returnedAssetID, err)
+			}
+		}
+	}
+
+	return nil
+
+}
